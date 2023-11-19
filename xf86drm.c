@@ -806,7 +806,6 @@ static int drmMatchBusID(const char *id1, const char *id2, int pci_domain_ok)
  * If any other failure happened then it will output error message using
  * drmMsg() call.
  */
-#if !UDEV
 static int chown_check_return(const char *path, uid_t owner, gid_t group)
 {
         int rv;
@@ -822,7 +821,6 @@ static int chown_check_return(const char *path, uid_t owner, gid_t group)
                path, errno, strerror(errno));
         return -1;
 }
-#endif
 
 static const char *drmGetDeviceName(int type)
 {
@@ -835,20 +833,65 @@ static const char *drmGetDeviceName(int type)
     return NULL;
 }
 
-/**
- * Open the DRM device, creating it if necessary.
- *
- * \param dev major and minor numbers of the device.
- * \param minor minor number of the device.
- *
- * \return a file descriptor on success, or a negative value on error.
- *
- * \internal
- * Assembles the device name from \p minor and opens it, creating the device
- * special file node with the major and minor numbers specified by \p dev and
- * parent directory if necessary and was called by root.
- */
-static int drmOpenDevice(dev_t dev, int minor, int type)
+
+//  50 * 20 usec == 1000 usec == 0.001 seconds
+#define UDEV_MAX_POLL_COUNT 50
+#define UDEV_BACKOFF_DELAY_USEC 20
+
+
+static int drmAcquireOpenDeviceUdevStrategy(dev_t dev, int minor, int type)
+{
+    stat_t          st;
+    const char      *dev_name = drmGetDeviceName(type);
+    char            buf[DRM_NODE_NAME_MAX];
+    int             fd;
+    int             udev_poll_count;
+
+    if (!dev_name)
+        return -EINVAL;
+
+    sprintf(buf, dev_name, DRM_DIR_NAME, minor);
+    drmMsg("drmAcquireOpenDeviceUdevStrategy: node name is %s\n", buf);
+
+    drmMsg("drmAcquireOpenDeviceUdevStrategy: polling for node; at most %d rounds at %d usec back-off\n", 
+        UDEV_MAX_POLL_COUNT, UDEV_BACKOFF_DELAY_USEC);
+
+    udev_poll_count = 0;
+wait_for_udev_directory:
+    // wait for directory to appear
+    if (stat(DRM_DIR_NAME, &st)) {
+        usleep(UDEV_BACKOFF_DELAY_USEC);
+        udev_poll_count++;
+
+        if (udev_poll_count == UDEV_MAX_POLL_COUNT)
+            return -1;
+        goto wait_for_udev_directory;
+    }
+
+wait_for_udev_device:
+    if (stat(buf, &st)) {
+        usleep(UDEV_BACKOFF_DELAY_USEC);
+        udev_poll_count++;
+
+        if (udev_poll_count == UDEV_MAX_POLL_COUNT)
+            return -1;
+        // assume that the directory found above
+        // stays around while looking for the
+        // device itself
+        goto wait_for_udev_device;
+    }
+
+    fd = open(buf, O_RDWR | O_CLOEXEC);
+    drmMsg("drmAcquireOpenDeviceUdevStrategy: open result is %d, (%s)\n",
+           fd, fd < 0 ? strerror(errno) : "OK");
+    if (fd >= 0)
+        return fd;
+
+    return -errno;
+}
+
+
+static int drmAcquireOpenDeviceMknodStrategy(dev_t dev, int minor, int type)
 {
     stat_t          st;
     const char      *dev_name = drmGetDeviceName(type);
@@ -856,17 +899,16 @@ static int drmOpenDevice(dev_t dev, int minor, int type)
     int             fd;
     mode_t          devmode = DRM_DEV_MODE, serv_mode;
     gid_t           serv_group;
-#if !UDEV
+
     int             isroot  = !geteuid();
     uid_t           user    = DRM_DEV_UID;
     gid_t           group   = DRM_DEV_GID;
-#endif
 
     if (!dev_name)
         return -EINVAL;
 
     sprintf(buf, dev_name, DRM_DIR_NAME, minor);
-    drmMsg("drmOpenDevice: node name is %s\n", buf);
+    drmMsg("drmAcquireOpenDeviceMknodStrategy: node name is %s\n", buf);
 
     if (drm_server_info && drm_server_info->get_perms) {
         drm_server_info->get_perms(&serv_group, &serv_mode);
@@ -874,7 +916,6 @@ static int drmOpenDevice(dev_t dev, int minor, int type)
         devmode &= ~(S_IXUSR|S_IXGRP|S_IXOTH);
     }
 
-#if !UDEV
     if (stat(DRM_DIR_NAME, &st)) {
         if (!isroot)
             return DRM_ERR_NOT_ROOT;
@@ -896,38 +937,13 @@ static int drmOpenDevice(dev_t dev, int minor, int type)
         chown_check_return(buf, user, group);
         chmod(buf, devmode);
     }
-#else
-    /* if we modprobed then wait for udev */
-    {
-        int udev_count = 0;
-wait_for_udev:
-        if (stat(DRM_DIR_NAME, &st)) {
-            usleep(20);
-            udev_count++;
-
-            if (udev_count == 50)
-                return -1;
-            goto wait_for_udev;
-        }
-
-        if (stat(buf, &st)) {
-            usleep(20);
-            udev_count++;
-
-            if (udev_count == 50)
-                return -1;
-            goto wait_for_udev;
-        }
-    }
-#endif
 
     fd = open(buf, O_RDWR | O_CLOEXEC);
-    drmMsg("drmOpenDevice: open result is %d, (%s)\n",
+    drmMsg("drmAcquireOpenDeviceMknodStrategy: open result is %d, (%s)\n",
            fd, fd < 0 ? strerror(errno) : "OK");
     if (fd >= 0)
         return fd;
 
-#if !UDEV
     /* Check if the device node is not what we expect it to be, and recreate it
      * and try again if so.
      */
@@ -942,15 +958,100 @@ wait_for_udev:
         }
     }
     fd = open(buf, O_RDWR | O_CLOEXEC);
-    drmMsg("drmOpenDevice: open result is %d, (%s)\n",
+    drmMsg("drmAcquireOpenDeviceMknodStrategy: open result is %d, (%s)\n",
            fd, fd < 0 ? strerror(errno) : "OK");
     if (fd >= 0)
         return fd;
 
-    drmMsg("drmOpenDevice: Open failed\n");
+    drmMsg("drmAcquireOpenDeviceMknodStrategy: open failed\n");
     remove(buf);
-#endif
+
     return -errno;
+}
+
+
+#if UDEV
+    #define OPEN_DEVICE_STRATEGY_DEFAULT_UDEV true
+#else
+    #define OPEN_DEVICE_STRATEGY_DEFAULT_UDEV false
+#endif
+
+static int cached_open_device_strategy = 0;
+
+#define OPEN_DEVICE_STRATEGY_UNKNOWN 1
+#define OPEN_DEVICE_STRATEGY_UDEV 2
+#define OPEN_DEVICE_STRATEGY_MKNOD 3
+
+static int drmGetOpenDeviceStrategy(void)
+{
+    int resolved_open_device_strategy = cached_open_device_strategy;
+    if (!resolved_open_device_strategy) {
+
+        const char* env = getenv("LIBGL_ACQUIRE_OPEN_DEVICE_STRATEGY");
+        if (env) {
+            if (strstr(env, "udev")) {
+                resolved_open_device_strategy = OPEN_DEVICE_STRATEGY_UDEV;
+            } else
+            if (strstr(env, "mknod")) {
+                resolved_open_device_strategy = OPEN_DEVICE_STRATEGY_MKNOD;
+            } else {
+                drmMsg("drmGetOpenDeviceStrategy: value '%s' of environment variable LIBGL_ACQUIRE_OPEN_DEVICE_STRATEGY not understood; acceptable values are udev, mknod\n", env);
+                resolved_open_device_strategy = OPEN_DEVICE_STRATEGY_UNKNOWN;
+            }
+        } else {
+            resolved_open_device_strategy = OPEN_DEVICE_STRATEGY_UNKNOWN;
+        }
+
+        cached_open_device_strategy = resolved_open_device_strategy;
+    }
+
+    return resolved_open_device_strategy;
+}
+
+
+static int drmAcquireOpenDevice(dev_t dev, int minor, int type)
+{
+    switch (drmGetOpenDeviceStrategy()) 
+    {
+        case OPEN_DEVICE_STRATEGY_UDEV:
+            return drmAcquireOpenDeviceUdevStrategy(dev, minor, type);
+            break;
+        
+        case OPEN_DEVICE_STRATEGY_MKNOD:
+            return drmAcquireOpenDeviceMknodStrategy(dev, minor, type);
+            break;
+        default:
+            // fall-through, to be covered in case
+            // of misconfiguration
+            break;
+    }
+
+    if (OPEN_DEVICE_STRATEGY_DEFAULT_UDEV) {
+        return drmAcquireOpenDeviceUdevStrategy(dev, minor, type);
+    } else {
+        return drmAcquireOpenDeviceMknodStrategy(dev, minor, type);
+    }
+}
+
+
+/**
+ * Open the DRM device; creates the device if mknod strategy is active
+ *
+ * \param dev major and minor numbers of the device.
+ * \param minor minor number of the device.
+ *
+ * \return a file descriptor on success, or a negative value on error.
+ *
+ * \internal
+ * Assembles the device name from \p minor and opens it, creating the device
+ * special file node with the major and minor numbers specified by \p dev and
+ * parent directory if necessary and was called by root.
+ */
+static int drmAcquireOpenMinor(int minor, int type)
+{
+    dev_t dev = makedev(DRM_MAJOR, minor);
+
+    return drmAcquireOpenDevice(dev, minor, type);
 }
 
 
@@ -958,22 +1059,17 @@ wait_for_udev:
  * Open the DRM device
  *
  * \param minor device minor number.
- * \param create allow to create the device if set.
  *
  * \return a file descriptor on success, or a negative value on error.
  *
  * \internal
- * Calls drmOpenDevice() if \p create is set, otherwise assembles the device
- * name from \p minor and opens it.
+ * Assembles the device name from \p minor and opens it.
  */
-static int drmOpenMinor(int minor, int create, int type)
+static int drmOpenMinor(int minor, int type)
 {
     int  fd;
     char buf[DRM_NODE_NAME_MAX];
     const char *dev_name = drmGetDeviceName(type);
-
-    if (create)
-        return drmOpenDevice(makedev(DRM_MAJOR, minor), minor, type);
 
     if (!dev_name)
         return -EINVAL;
@@ -1001,7 +1097,7 @@ drm_public int drmAvailable(void)
     int           retval = 0;
     int           fd;
 
-    if ((fd = drmOpenMinor(0, 1, DRM_NODE_PRIMARY)) < 0) {
+    if ((fd = drmAcquireOpenMinor(0, DRM_NODE_PRIMARY)) < 0) {
 #ifdef __linux__
         /* Try proc for backward Linux compatibility */
         if (!access("/proc/dri/0", R_OK))
@@ -1079,6 +1175,38 @@ static const char *drmGetMinorName(int type)
     }
 }
 
+static int cached_assume_single_static_device = 0;
+
+#define ASSUME_SINGLE_STATIC_DEVICE_UNKNOWN 1
+#define ASSUME_SINGLE_STATIC_DEVICE_ENABLED 2
+#define ASSUME_SINGLE_STATIC_DEVICE_DISABLED 3
+
+static bool hasAssumeSingleStaticDeviceEnv(void) 
+{
+    int resolved_assume_single_static_device = cached_assume_single_static_device;
+    if(!cached_assume_single_static_device) {        
+        const char* env = getenv("LIBGL_ASSUME_SINGLE_STATIC_DEVICE");
+        if (env) {
+            if (strstr(env, "true")) {
+                resolved_assume_single_static_device = ASSUME_SINGLE_STATIC_DEVICE_ENABLED;
+            } else
+            if (strstr(env, "false")) {
+                resolved_assume_single_static_device = ASSUME_SINGLE_STATIC_DEVICE_DISABLED;
+            } else {
+                drmMsg("hasAssumeSingleStaticDeviceEnv: value '%s' of environment variable LIBGL_ASSUME_SINGLE_STATIC_DEVICE not understood; acceptable values are true, false\n", env);
+                resolved_assume_single_static_device = OPEN_DEVICE_STRATEGY_UNKNOWN;
+            }
+        } else {
+            resolved_assume_single_static_device = ASSUME_SINGLE_STATIC_DEVICE_UNKNOWN;
+        }
+
+        cached_assume_single_static_device = resolved_assume_single_static_device;
+    }
+
+    return (resolved_assume_single_static_device == ASSUME_SINGLE_STATIC_DEVICE_ENABLED);
+}
+
+
 /**
  * Open the device by bus ID.
  *
@@ -1088,12 +1216,12 @@ static const char *drmGetMinorName(int type)
  * \return a file descriptor on success, or a negative value on error.
  *
  * \internal
- * This function attempts to open every possible minor (up to DRM_MAX_MINOR),
+ * This function attempts to open every available minor,
  * comparing the device bus ID with the one supplied.
  *
- * \sa drmOpenMinor() and drmGetBusid().
+ * \sa drmAcquireOpenMinor() and drmGetBusid().
  */
-static int drmOpenByBusid(const char *busid, int type)
+static int drmAcquireOpenByBusid(const char *busid, int type)
 {
     int        i, pci_domain_ok = 1;
     int        fd;
@@ -1104,10 +1232,10 @@ static int drmOpenByBusid(const char *busid, int type)
     if (base < 0)
         return -1;
 
-    drmMsg("drmOpenByBusid: Searching for BusID %s\n", busid);
+    drmMsg("drmAcquireOpenByBusid: Searching for BusID %s\n", busid);
     for (i = base; i < base + DRM_MAX_MINOR; i++) {
-        fd = drmOpenMinor(i, 1, type);
-        drmMsg("drmOpenByBusid: drmOpenMinor returns %d\n", fd);
+        fd = drmAcquireOpenMinor(i, type);
+        drmMsg("drmAcquireOpenByBusid: drmOpenMinor returns %d\n", fd);
         if (fd >= 0) {
             /* We need to try for 1.4 first for proper PCI domain support
              * and if that fails, we know the kernel is busted
@@ -1124,11 +1252,11 @@ static int drmOpenByBusid(const char *busid, int type)
                 sv.drm_di_minor = 1;
                 sv.drm_dd_major = -1;       /* Don't care */
                 sv.drm_dd_minor = -1;       /* Don't care */
-                drmMsg("drmOpenByBusid: Interface 1.4 failed, trying 1.1\n");
+                drmMsg("drmAcquireOpenByBusid: Interface 1.4 failed, trying 1.1\n");
                 drmSetInterfaceVersion(fd, &sv);
             }
             buf = drmGetBusid(fd);
-            drmMsg("drmOpenByBusid: drmGetBusid reports %s\n", buf);
+            drmMsg("drmAcquireOpenByBusid: drmGetBusid reports %s\n", buf);
             if (buf && drmMatchBusID(buf, busid, pci_domain_ok)) {
                 drmFreeBusid(buf);
                 return fd;
@@ -1155,9 +1283,9 @@ static int drmOpenByBusid(const char *busid, int type)
  * isn't already in use.  If it's in use it then it will already have a bus ID
  * assigned.
  *
- * \sa drmOpenMinor(), drmGetVersion() and drmGetBusid().
+ * \sa drmAcquireOpenMinor(), drmGetVersion() and drmGetBusid().
  */
-static int drmOpenByName(const char *name, int type)
+static int drmAcquireOpenByName(const char *name, int type)
 {
     int           i;
     int           fd;
@@ -1173,12 +1301,12 @@ static int drmOpenByName(const char *name, int type)
      * already in use.  If it's in use it will have a busid assigned already.
      */
     for (i = base; i < base + DRM_MAX_MINOR; i++) {
-        if ((fd = drmOpenMinor(i, 1, type)) >= 0) {
+        if ((fd = drmAcquireOpenMinor(i, type) >= 0)) {
             if ((version = drmGetVersion(fd))) {
                 if (!strcmp(version->name, name)) {
                     drmFreeVersion(version);
                     id = drmGetBusid(fd);
-                    drmMsg("drmGetBusid returned '%s'\n", id ? id : "NULL");
+                    drmMsg("drmAcquireOpenByName: drmGetBusid returned '%s'\n", id ? id : "NULL");
                     if (!id || !*id) {
                         if (id)
                             drmFreeBusid(id);
@@ -1194,7 +1322,7 @@ static int drmOpenByName(const char *name, int type)
         }
     }
 
-#ifdef __linux__
+#ifdef __linux__ 
     /* Backward-compatibility /proc support */
     for (i = 0; i < 8; i++) {
         char proc_name[64], buf[512];
@@ -1215,9 +1343,9 @@ static int drmOpenByName(const char *name, int type)
                         for (devstring = ++pt; *pt && *pt != ' '; ++pt)
                             ;
                         if (*pt) { /* Found busid */
-                            return drmOpenByBusid(++pt, type);
+                            return drmAcquireOpenByBusid(++pt, type);
                         } else { /* No busid */
-                            return drmOpenDevice(strtol(devstring, NULL, 0),i, type);
+                            return drmAcquireOpenDevice(strtol(devstring, NULL, 0),i, type);
                         }
                     }
                 }
@@ -1242,7 +1370,7 @@ static int drmOpenByName(const char *name, int type)
  * \return a file descriptor on success, or a negative value on error.
  *
  * \internal
- * It calls drmOpenByBusid() if \p busid is specified or drmOpenByName()
+ * It calls drmAcquireOpenByBusid() if \p busid is specified or drmAcquireOpenByName()
  * otherwise.
  */
 drm_public int drmOpen(const char *name, const char *busid)
@@ -1250,20 +1378,52 @@ drm_public int drmOpen(const char *name, const char *busid)
     return drmOpenWithType(name, busid, DRM_NODE_PRIMARY);
 }
 
+
+static int drmAcquireSingleStaticDevice(int type)
+{
+    int fd;
+    int base = drmGetMinorBase(type);
+
+    if (base < 0)
+        return -1;
+
+    drmMsg("drmAcquireSingleStaticDevice: scanning up to %d minor\n", DRM_MAX_MINOR);
+
+    for (int i = base; i < base + DRM_MAX_MINOR; i++) {
+        fd = drmAcquireOpenMinor(i, type);
+        drmMsg("drmAcquireSingleStaticDevice: drmOpenMinor returns %d\n", fd);
+
+        if ((fd >= 0)) {
+            return fd;
+        }
+
+    }
+
+    return -1;
+}
+
+
 /**
  * Open the DRM device with specified type.
  *
- * Looks up the specified name and bus ID, and opens the device found.  The
+ * Matches found devices either on (first) specified bus ID, or
+ * (second) name and opens the device found.
+ *
+ * If the mknod strategy is active, then, as a side-effect, an
  * entry in /dev/dri is created if necessary and if called by root.
+ *
+ * If the udev strategy is active, then the implementation awaits
+ * creation of a suitable entry in /dev/dri, but will time out
+ * after a very short time.
  *
  * \param name driver name. Not referenced if bus ID is supplied.
  * \param busid bus ID. Zero if not known.
- * \param type the device node type to open, PRIMARY or RENDER
+ * \param type the device node type to open, DRM_NODE_PRIMARY or DRM_NODE_RENDER
  *
  * \return a file descriptor on success, or a negative value on error.
  *
  * \internal
- * It calls drmOpenByBusid() if \p busid is specified or drmOpenByName()
+ * It calls drmAcquireOpenByBusid() if \p busid is specified or drmAcquireOpenByName()
  * otherwise.
  */
 drm_public int drmOpenWithType(const char *name, const char *busid, int type)
@@ -1277,14 +1437,25 @@ drm_public int drmOpenWithType(const char *name, const char *busid, int type)
         }
     }
 
+    if (hasAssumeSingleStaticDeviceEnv()) {
+        drmMsg("drmOpenWithType: assuming single static device\n");
+        return drmAcquireSingleStaticDevice(type);
+    } else {
+        drmMsg("drmOpenWithType: running default acquisition\n");
+    }
+
     if (busid) {
-        int fd = drmOpenByBusid(busid, type);
-        if (fd >= 0)
+        int fd;
+
+        drmMsg("drmOpenWithType: opening by busid %s\n", busid);
+        if ( (fd = drmAcquireOpenByBusid(busid, type) ) >= 0)
             return fd;
     }
 
-    if (name)
-        return drmOpenByName(name, type);
+    if (name) {
+        drmMsg("drmOpenWithType: opening by name %s\n", name);
+        return drmAcquireOpenByName(name, type);
+    }
 
     return -1;
 }
@@ -1296,7 +1467,7 @@ drm_public int drmOpenControl(int minor)
 
 drm_public int drmOpenRender(int minor)
 {
-    return drmOpenMinor(minor, 0, DRM_NODE_RENDER);
+    return drmOpenMinor(minor, DRM_NODE_RENDER);
 }
 
 /**
