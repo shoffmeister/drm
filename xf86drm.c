@@ -1249,6 +1249,30 @@ drm_public int drmOpen(const char *name, const char *busid)
     return drmOpenWithType(name, busid, DRM_NODE_PRIMARY);
 }
 
+
+static int drmAcquireSingleStaticDevice(int type)
+{
+    int fd;
+    int base = drmGetMinorBase(type);
+
+    if (base < 0)
+        return -1;
+
+    drmMsg("drmAcquireSingleStaticDevice: scanning up to %d minor\n", DRM_MAX_MINOR);
+
+    for (int i = base; i < base + DRM_MAX_MINOR; i++) {
+        fd = drmOpenMinor(i, 1, type);
+        drmMsg("drmAcquireSingleStaticDevice: drmOpenMinor returns %d\n", fd);
+
+        if (fd >= 0) {
+            return fd;
+        }
+
+    }
+
+    return -1;
+}
+
 /**
  * Open the DRM device with specified type.
  *
@@ -1274,6 +1298,13 @@ drm_public int drmOpenWithType(const char *name, const char *busid, int type)
             drmMsg("[drm] failed to load kernel module \"%s\"\n", name);
             return -1;
         }
+    }
+
+    {
+        int fd = drmAcquireSingleStaticDevice(type);
+        if (fd >= 0)
+            return fd;
+        return fd;
     }
 
     if (busid) {
