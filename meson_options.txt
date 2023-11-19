@@ -107,7 +107,7 @@ option(
   'udev',
   type : 'boolean',
   value : false,
-  description : 'Enable support for using udev instead of mknod.',
+  description : 'Depend on a service (e.g. udevd) to create device nodes asynchronously; disable explicit use of mknod.',
 )
 option(
   'tests',
