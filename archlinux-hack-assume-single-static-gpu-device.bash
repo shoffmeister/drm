@@ -4,7 +4,7 @@ set -e
 
 PATCH_FILE=tune-for-single-static-gpu.patch
 ARCH_LIBDRM_DIRECTORY=~/git/gitlab.archlinux.org/archlinux/packaging/packages/libdrm
-LIBDRM_VERSION="2.4.121"
+LIBDRM_VERSION="2.4.122"
 
 echo "
 Capturing sudo caching first to enable uninterrupted script execution
